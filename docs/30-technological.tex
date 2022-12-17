@@ -1,0 +1,169 @@
+\chapter{Технологический раздел}
+
+\section{Выбор средств разработки}
+
+В качестве языка программирования для реализации поставленной задачи был выбран язык Си. Для сборки модуля использовалась утилита make.
+%, так как на нем написано ядро OC Linux\cite{ci}
+В качестве среды разработки был выбран Qt Creator\cite{qt}, так как он кроссплатформенный, бесплатный и использовался в курсе программирования ранее. 
+
+
+\section{Инициализация модуля}
+В листинге~\ref{lst:init} приведена реализация функции инициализации модуля.
+
+\begin{lstlisting}[caption = {Функция инициализации модуля}, label=lst:init]
+int netfilter_init(void)
+{
+	DMSG("call init");
+	
+	/* proc-файл для записи правил */
+	proc_file = proc_create(PROC_FILE_NAME, S_IRUGO | S_IWUGO, NULL, &proc_fops);
+	if (!proc_file) 
+	{
+		DMSG("call proc_create_data() fail");
+		return -ENOMEM;
+	}
+	DMSG("proc file created");	
+	
+	/* структура для фильтрации входящих пакетов */
+	nfho_in.hook = hook_func_in; // функция, которая будет обрабатывать пакеты
+	nfho_in.hooknum = NF_INET_LOCAL_IN; // точка, в которой должна срабатывать функция
+	nfho_in.pf = PF_INET; //семейство протоколов
+	nfho_in.priority = NF_IP_PRI_FIRST; // приоритет функции (самый высокий)
+	
+	/* регистрация структуры */
+	if (nf_register_net_hook(&init_net, &nfho_in) < 0)
+	{
+		DMSG("call nf_register_net_hook(NF_INET_LOCAL_IN) fail");
+		return -ENOMEM;
+	}
+	
+	/*  структура для фильтрации исходящих пакетов*/
+	nfho_out.hook = hook_func_out;
+	nfho_out.hooknum = NF_INET_LOCAL_OUT;
+	nfho_out.pf = PF_INET;
+	nfho_out.priority = NF_IP_PRI_FIRST;
+	
+	/* регистрация структуры */
+	if (nf_register_net_hook(&init_net, &nfho_out) < 0)
+	{
+		DMSG("call nf_register_net_hook(NF_INET_LOCAL_OUT) fail");
+		return -ENOMEM;
+	}
+	
+	DMSG("Firewall module loaded successfully");
+	return 0;
+}
+\end{lstlisting}
+
+
+
+\section{Фильтрация сетевых пакетов}
+
+В листинге~\ref{lst:in} приведена реализация функции фильтрации входящих сетевых пакетов.
+
+\begin{lstlisting}[caption = {Функция фильтрации входящих сетевых пакетов}, label=lst:in]
+unsigned int hook_func_in(void *info, struct sk_buff *skb, const struct nf_hook_state *state)
+{
+	int is_unauthorotuve = parse_dns(skb, state->hook);
+	if (bu && is_unauthorotuve)
+	{
+		DMSG("!!! Drop unauthorotive DNS answer");
+		return NF_DROP;
+	}
+	struct iphdr *ip_header;
+	sock_buff = skb;
+	if(!sock_buff) 
+	{ 
+		return NF_ACCEPT;
+	}
+	
+	
+	ip_header = ip_hdr(sock_buff);
+	
+	struct firewall_rule cur_rule;
+	cur_rule.in = IN;
+	snprintf(cur_rule.src_ip, BUFFER_SIZE, "%pI4", &ip_header->saddr);
+	snprintf(cur_rule.dest_ip, BUFFER_SIZE, "%pI4", &ip_header->daddr);
+	cur_rule.protocol = ip_header->protocol;
+	
+	if (ip_header->protocol==IPPROTO_UDP)
+	{
+		struct udphdr *udp_header = (struct udphdr *)skb_transport_header(skb);
+		cur_rule.src_port = (unsigned int)ntohs(udp_header->source);
+		cur_rule.dest_port = (unsigned int)ntohs(udp_header->dest);
+	}
+	else if (ip_header->protocol == IPPROTO_TCP)
+	{
+		struct tcphdr *tcp_header = (struct tcphdr *)skb_transport_header(skb);
+		cur_rule.src_port = (unsigned int)ntohs(tcp_header->source);
+		cur_rule.dest_port = (unsigned int)ntohs(tcp_header->dest);
+	}
+	else
+	{
+		cur_rule.src_port = (unsigned int) 0;
+		cur_rule.dest_port = (unsigned int) 0;
+	}
+	
+	if ((bs == 1) && (!strcmp(cur_rule.src_ip, localhost)))
+	{
+		DMSG("!!!!!! Drop incoming packet as suspicious for spoof, src_ip: %s", cur_rule.src_ip);
+		return NF_DROP;
+	}
+	
+	int i;
+	for (i = 0; i < in_index; i++)
+	{
+		if (rules_match(&cur_rule, &(iniplist[i])) == 0)
+		{
+			DMSG("Drop incoming packet: %s", str_rule(&cur_rule));
+			return NF_DROP;
+		}
+	}
+	
+	return NF_ACCEPT;
+}
+\end{lstlisting}
+
+
+
+
+\section{Вывод информации о DNS-пакете}
+
+В листинге~\ref{lst:dns} приведена реализация функции вывода информации о DNS-пакете и проверки того, от какого сервера получен ответ -- авторитетного или нет.
+
+\begin{lstlisting}[caption = {Функция вывода информации о DNS-пакете}, label=lst:dns]
+static int show_info_about_dns(struct dnshdr *dns_hdr)
+{
+	DMSG("DNS %s", dns_hdr->qr == 0 ? "query" : "response"); 
+	DMSG("AA bit: %s", dns_hdr->aa == 1 ? "set" : "unset");
+	int is_anauthorotive = dns_hdr->aa == 1 ? 0 : 1;
+	
+	// количество записей в секциях запроса и ответа  
+	size_t q_count = ntohs(dns_hdr->qdcount);
+	size_t a_count = ntohs(dns_hdr->ancount);
+	DMSG("question count = %zd, answer count = %zd", q_count, a_count);
+	
+	__u8 *section_start = ((__u8 *) dns_hdr) + sizeof(struct dnshdr);
+	size_t s_index, s_count = 0;
+	
+	// секция запросов
+	for(s_index = 0; s_index < q_count; s_index++)
+	{
+		DMSG("question section %zd", s_index + 1);
+		s_count = parse_question_section(dns_hdr, section_start);
+		section_start += s_count;
+	}
+	
+	//  секция ответов
+	for(s_index = 0; s_index < a_count; s_index++)
+	{
+		DMSG("answer section %zd", s_index + 1);
+		s_count = parse_answer_section(dns_hdr, section_start);
+		section_start += s_count;
+	}
+	
+	return is_anauthorotive;
+}
+\end{lstlisting}
+
+
